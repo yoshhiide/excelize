@@ -380,6 +380,149 @@ func TestStreamSetRowWithStyle(t *testing.T) {
 	}
 }
 
+func TestStreamReader(t *testing.T) {
+	// 1. Basic Reading Test
+	t.Run("BasicReading", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "test_stream_read_basic.xlsx")
+		f := NewFile()
+		sheetName := "Sheet1"
+
+		// Add some data
+		assert.NoError(t, f.SetCellValue(sheetName, "A1", "Hello"))
+		assert.NoError(t, f.SetCellValue(sheetName, "B1", "World"))
+		assert.NoError(t, f.SetCellValue(sheetName, "A2", 123))
+		assert.NoError(t, f.SetCellValue(sheetName, "B2", 45.67))
+		assert.NoError(t, f.SetRow(sheetName, "A3", []interface{}{"Mixed", 100, nil, "Data"}))
+
+		assert.NoError(t, f.SaveAs(tempFile))
+		assert.NoError(t, f.Close())
+
+		fo, err := OpenFile(tempFile)
+		assert.NoError(t, err)
+		assert.NotNil(t, fo)
+
+		sr, err := fo.NewStreamReader(sheetName)
+		assert.NoError(t, err)
+		assert.NotNil(t, sr)
+
+		expectedData := [][]string{
+			{"Hello", "World"},
+			{"123", "45.67"},
+			{"Mixed", "100", "", "Data"},
+		}
+		rowIndex := 0
+		for sr.NextRow() {
+			row, errGet := sr.GetRow()
+			assert.NoError(t, errGet)
+			if rowIndex < len(expectedData) {
+				assert.Equal(t, expectedData[rowIndex], row)
+			}
+			rowIndex++
+		}
+		assert.Equal(t, len(expectedData), rowIndex, "Number of rows read should match expected")
+
+		assert.NoError(t, sr.Close())
+		assert.NoError(t, fo.Close())
+	})
+
+	// 2. Empty Sheet Test
+	t.Run("EmptySheet", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "test_stream_read_empty.xlsx")
+		f := NewFile()
+		sheetName := "Sheet1"
+		f.DeleteSheet(sheetName)
+		idx, err := f.NewSheet(sheetName)
+		assert.NoError(t, err)
+		f.SetActiveSheet(idx)
+
+		assert.NoError(t, f.SaveAs(tempFile))
+		assert.NoError(t, f.Close())
+
+		fo, err := OpenFile(tempFile)
+		assert.NoError(t, err)
+		sr, err := fo.NewStreamReader(sheetName)
+		assert.NoError(t, err)
+
+		assert.False(t, sr.NextRow(), "NextRow on empty sheet should return false")
+
+		row, errGetRow := sr.GetRow()
+		assert.Error(t, errGetRow, "GetRow after NextRow failed should return an error")
+		assert.Nil(t, row, "Row should be nil if NextRow failed and no prior row was loaded")
+
+		assert.NoError(t, sr.Close())
+		assert.NoError(t, fo.Close())
+	})
+
+	// 3. Non-existent Sheet Test
+	t.Run("NonExistentSheet", func(t *testing.T) {
+		f := NewFile()
+		sheetName := "SheetThatDoesNotExist"
+		_, err := f.NewStreamReader(sheetName)
+		assert.Error(t, err)
+		if assert.IsType(t, ErrSheetNotExist{}, err) {
+			assert.EqualError(t, err, (ErrSheetNotExist{SheetName: sheetName}).Error())
+		}
+		assert.NoError(t, f.Close())
+	})
+
+	// 4. Reading after Close Test
+	t.Run("ReadingAfterClose", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "test_stream_read_after_close.xlsx")
+		f := NewFile()
+		sheetName := "Sheet1"
+		assert.NoError(t, f.SetCellValue(sheetName, "A1", "Data"))
+		assert.NoError(t, f.SaveAs(tempFile))
+		assert.NoError(t, f.Close())
+
+		fo, err := OpenFile(tempFile)
+		assert.NoError(t, err)
+		sr, err := fo.NewStreamReader(sheetName)
+		assert.NoError(t, err)
+
+		assert.True(t, sr.NextRow())
+		_, errGetRow := sr.GetRow()
+		assert.NoError(t, errGetRow)
+
+		assert.NoError(t, sr.Close())
+
+		assert.False(t, sr.NextRow(), "NextRow after close should return false")
+		_, errGetRow = sr.GetRow()
+		assert.Error(t, errGetRow, "GetRow after close should return an error")
+
+		assert.NoError(t, fo.Close())
+	})
+
+	// 5. Many Rows Test (Simplified)
+	t.Run("ManyRows", func(t *testing.T) {
+		tempFile := filepath.Join(t.TempDir(), "test_stream_read_many.xlsx")
+		f := NewFile()
+		sheetName := "Sheet1"
+		numRows := 200
+		for r := 1; r <= numRows; r++ {
+			cellName, _ := CoordinatesToCellName(1, r)
+			assert.NoError(t, f.SetCellValue(sheetName, cellName, "Row"+strconv.Itoa(r)))
+		}
+		assert.NoError(t, f.SaveAs(tempFile))
+		assert.NoError(t, f.Close())
+
+		fo, err := OpenFile(tempFile)
+		assert.NoError(t, err)
+		sr, err := fo.NewStreamReader(sheetName)
+		assert.NoError(t, err)
+
+		rowsRead := 0
+		for sr.NextRow() {
+			_, errGetRow := sr.GetRow()
+			assert.NoError(t, errGetRow)
+			rowsRead++
+		}
+		assert.Equal(t, numRows, rowsRead, "Should read all rows")
+
+		assert.NoError(t, sr.Close())
+		assert.NoError(t, fo.Close())
+	})
+}
+
 func TestStreamSetCellValFunc(t *testing.T) {
 	f := NewFile()
 	defer func() {
@@ -486,4 +629,96 @@ func TestStreamWriterGetRowElement(t *testing.T) {
 		_, ok := getRowElement(token, 0)
 		assert.False(t, ok)
 	}
+}
+
+func ExampleFile_NewStreamReader() {
+	// Create a new Excel file for the example
+	f := NewFile()
+	sheetName := "Sheet1"
+
+	// Add some data to the sheet
+	if err := f.SetCellValue(sheetName, "A1", "Name"); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := f.SetCellValue(sheetName, "B1", "Age"); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := f.SetRow(sheetName, "A2", []interface{}{"Alice", 30}); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := f.SetRow(sheetName, "A3", []interface{}{"Bob", 24}); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// For a runnable example, we would save and reopen.
+	// To keep it self-contained and runnable by `go test`, we can use a pipe
+	// or simulate by directly using the f object if NewStreamReader could work on an in-memory f.
+	// However, NewStreamReader reads from f.Pkg, which is populated during OpenFile.
+	// So, a save and open cycle is more representative of real usage.
+	// Let's use a temporary file for the example to run correctly.
+
+	tempDir := os.TempDir() // Or t.TempDir() if in a _test.go Example that has *testing.T
+	// For package examples, os.TempDir() is fine, but remember cleanup.
+	// Go's example runner doesn't pass *testing.T, so t.TempDir() isn't available.
+	// We need to handle potential errors from os.CreateTemp or ensure file is cleaned.
+	// For simplicity, let's assume a path. In real `go test` examples, output is checked.
+
+	exampleFilePath := filepath.Join(tempDir, "example_stream_reader.xlsx")
+	if err := f.SaveAs(exampleFilePath); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// Open the created file
+	fo, err := OpenFile(exampleFilePath)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() {
+		if err := fo.Close(); err != nil {
+			fmt.Println(err)
+		}
+		// Attempt to remove the temporary file
+		if err := os.Remove(exampleFilePath); err != nil {
+			// fmt.Println("Error removing temp file:", err) // Optional: log cleanup error
+		}
+	}()
+
+	sr, err := fo.NewStreamReader(sheetName)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() {
+		if err := sr.Close(); err != nil {
+			fmt.Println(err)
+		}
+	}()
+
+	fmt.Println("Reading sheet:", sheetName)
+	// Read rows
+	for sr.NextRow() {
+		row, err := sr.GetRow()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		// Join cells with a comma for printing
+		fmt.Println(strings.Join(row, ", "))
+	}
+
+	// Output:
+	// Reading sheet: Sheet1
+	// Name, Age
+	// Alice, 30
+	// Bob, 24
 }

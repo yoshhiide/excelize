@@ -37,6 +37,20 @@ type StreamWriter struct {
 	tableParts      string
 }
 
+// StreamReader defined the type of stream reader.
+type StreamReader struct {
+	file         *File
+	Sheet        string
+	SheetID      int
+	xmlReader    *xml.Decoder
+	rowReader    *strings.Reader // For re-reading current row's cells
+	currentRow   []string        // Buffer for the current row's cell values
+	sheetXMLPath string          // Path to the worksheet XML file
+	decoder      *xml.Decoder    // Main decoder for the sheet XML
+	token        xml.Token       // Current XML token
+	fileHandle   io.ReadCloser   // File handle for the worksheet XML
+}
+
 // NewStreamWriter returns stream writer struct by given worksheet name used for
 // writing data on a new existing empty worksheet with large amounts of data.
 // Note that after writing data with the stream writer for the worksheet, you
@@ -139,6 +153,116 @@ func (f *File) NewStreamWriter(sheet string) (*StreamWriter, error) {
 	_, _ = sw.rawData.WriteString(xml.Header + `<worksheet` + templateNamespaceIDMap)
 	bulkAppendFields(&sw.rawData, sw.worksheet, 3, 4)
 	return sw, err
+}
+
+// NewStreamReader returns stream reader struct by given worksheet name.
+func (f *File) NewStreamReader(sheet string) (*StreamReader, error) {
+	if err := checkSheetName(sheet); err != nil {
+		return nil, err
+	}
+	sheetID := f.getSheetID(sheet)
+	if sheetID == -1 {
+		return nil, ErrSheetNotExist{sheet}
+	}
+	sheetXMLPath, ok := f.getSheetXMLPath(sheet)
+	if !ok {
+		return nil, ErrSheetNotExist{sheet}
+	}
+	xmlFile, err := f.Pkg.Open(sheetXMLPath)
+	if err != nil {
+		return nil, err
+	}
+	return &StreamReader{
+		file:         f,
+		Sheet:        sheet,
+		SheetID:      sheetID,
+		sheetXMLPath: sheetXMLPath,
+		fileHandle:   xmlFile,
+		decoder:      f.xmlNewDecoder(xmlFile),
+	}, nil
+}
+
+// NextRow advances the StreamReader to the next row in the worksheet.
+// It returns true if a row is successfully read, and false if there are no more
+// rows or an error occurs.
+func (sr *StreamReader) NextRow() bool {
+	if sr.fileHandle == nil { // Check if the stream has been closed
+		sr.token = nil // Explicitly nil token if called on closed stream
+		return false
+	}
+	sr.currentRow = nil
+	sr.rowReader = nil
+	// sr.token should not be nilled here, only if an error occurs or EOF
+
+	for {
+		tok, err := sr.decoder.Token()
+		if err != nil { // Handles io.EOF or other errors
+			sr.token = nil // Set token to nil on EOF or any error
+			return false
+		}
+		if se, ok := tok.(xml.StartElement); ok && se.Name.Local == "row" {
+			sr.token = se // Store the start element of the row
+			return true
+		}
+		// If token is not a row's start and no error, continue loop to get next token.
+	}
+}
+
+// GetRow returns the cell values for the current row. It should be called
+// after NextRow.
+func (sr *StreamReader) GetRow() ([]string, error) {
+	if sr.fileHandle == nil {
+		return nil, fmt.Errorf("stream closed")
+	}
+	if sr.token == nil {
+		return nil, fmt.Errorf("call NextRow() before GetRow()")
+	}
+	if sr.currentRow != nil {
+		return sr.currentRow, nil
+	}
+
+	startElement, ok := sr.token.(xml.StartElement)
+	if !ok {
+		return nil, fmt.Errorf("internal error: sr.token is not xml.StartElement")
+	}
+
+	var r xlsxRow
+	if err := sr.decoder.DecodeElement(&r, &startElement); err != nil {
+		return nil, err
+	}
+
+	sst, err := sr.file.sharedStrings()
+	if err != nil {
+		return nil, err
+	}
+
+	var cellValues []string
+	for _, c := range r.C {
+		val, err := c.getValueFrom(sr.file, sst, false)
+		if err != nil {
+			// In case of error, append an empty string or handle as needed
+			cellValues = append(cellValues, "")
+			// Optionally log the error, e.g., log.Printf("Error getting cell value: %v", err)
+			continue
+		}
+		cellValues = append(cellValues, val)
+	}
+	sr.currentRow = cellValues
+	return sr.currentRow, nil
+}
+
+// Close closes the worksheet XML file, allowing the underlying file to be
+// processed or closed.
+func (sr *StreamReader) Close() error {
+	sr.currentRow = nil
+	sr.rowReader = nil
+	sr.token = nil
+	if sr.fileHandle != nil {
+		err := sr.fileHandle.Close()
+		sr.fileHandle = nil
+		return err
+	}
+	return nil
 }
 
 // AddTable creates an Excel table for the StreamWriter using the given
